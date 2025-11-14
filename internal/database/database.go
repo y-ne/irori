@@ -42,20 +42,15 @@ func Connect(ctx context.Context) error {
 		return err
 	}
 
-	slog.Info("database connected",
-		"max_conns", cfg.MaxConns,
-		"min_conns", cfg.MinConns,
-		"max_conn_lifetime", cfg.MaxConnLifetime,
-		"max_conn_idle_time", cfg.MaxConnIdleTime,
-	)
+	slog.LogAttrs(ctx, slog.LevelInfo, "database connected",
+		slog.Int("max_conns", int(cfg.MaxConns)),
+		slog.Int("min_conns", int(cfg.MinConns)))
 
 	return nil
 }
 
 func Close() {
 	if Pool != nil {
-		slog.Info("closing database connection pool")
 		Pool.Close()
-		slog.Info("database connection pool closed")
 	}
 }
