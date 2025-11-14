@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/sync/errgroup"
 
@@ -47,7 +48,9 @@ func main() {
 	concurrency := runtime.GOMAXPROCS(0)
 	batchSize := concurrency * 3
 
-	slog.Info("irori started", "concurrency", concurrency, "batch_size", batchSize)
+	slog.LogAttrs(ctx, slog.LevelInfo, "irori started",
+		slog.Int("concurrency", concurrency),
+		slog.Int("batch_size", batchSize))
 
 	go func() {
 		ticker := time.NewTicker(pollInterval)
@@ -67,14 +70,14 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	slog.Info("shutting down")
+	slog.LogAttrs(ctx, slog.LevelInfo, "shutting down")
 	cancel()
 }
 
 func processBatch(ctx context.Context, batchSize, concurrency int) {
 	tx, err := database.Pool.Begin(ctx)
 	if err != nil {
-		slog.Error("begin tx failed", "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "begin tx failed", slog.Any("error", err))
 		return
 	}
 	defer tx.Rollback(ctx)
@@ -88,17 +91,19 @@ func processBatch(ctx context.Context, batchSize, concurrency int) {
 		FOR UPDATE SKIP LOCKED
 	`, batchSize)
 	if err != nil {
-		slog.Error("query failed", "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "query failed", slog.Any("error", err))
 		return
 	}
 
-	var items []Item
-	for rows.Next() {
+	items, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Item, error) {
 		var item Item
-		rows.Scan(&item.ID, &item.Payload, &item.RetryCount, &item.MaxRetries)
-		items = append(items, item)
+		err := row.Scan(&item.ID, &item.Payload, &item.RetryCount, &item.MaxRetries)
+		return item, err
+	})
+	if err != nil {
+		slog.LogAttrs(ctx, slog.LevelError, "scan failed", slog.Any("error", err))
+		return
 	}
-	rows.Close()
 
 	if len(items) == 0 {
 		return
@@ -111,22 +116,21 @@ func processBatch(ctx context.Context, batchSize, concurrency int) {
 
 	_, err = tx.Exec(ctx, `UPDATE irori SET status = 'processing' WHERE id = ANY($1)`, itemIDs)
 	if err != nil {
-		slog.Error("update failed", "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "update failed", slog.Any("error", err))
 		return
 	}
 
 	if err = tx.Commit(ctx); err != nil {
-		slog.Error("commit failed", "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "commit failed", slog.Any("error", err))
 		return
 	}
 
-	slog.Info("processing", "count", len(items))
+	slog.LogAttrs(ctx, slog.LevelInfo, "processing", slog.Int("count", len(items)))
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
 	for _, item := range items {
-		item := item
 		g.Go(func() error {
 			processItem(gctx, item)
 			return nil
@@ -144,8 +148,11 @@ func processItem(ctx context.Context, item Item) {
 	err := process(ctx, item)
 
 	if err == nil {
-		database.Pool.Exec(ctx, `UPDATE irori SET status = 'success', completed_at = NOW() WHERE id = $1`, item.ID)
-		slog.Info("success", "id", item.ID)
+		if _, err := database.Pool.Exec(ctx, `UPDATE irori SET status = 'success', completed_at = NOW() WHERE id = $1`, item.ID); err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "failed to mark success", slog.Int64("id", item.ID), slog.Any("error", err))
+		} else {
+			slog.LogAttrs(ctx, slog.LevelInfo, "success", slog.Int64("id", item.ID))
+		}
 	} else {
 		retry(ctx, item, err)
 	}
@@ -157,19 +164,21 @@ func process(ctx context.Context, item Item) error {
 		return err
 	}
 
-	slog.Info("processing", "id", item.ID, "payload", payload)
+	slog.LogAttrs(ctx, slog.LevelInfo, "processing",
+		slog.Int64("id", item.ID),
+		slog.Any("payload", payload))
 
 	// TODO: Implement your logic here
 
 	return nil
 }
 
-func retry(ctx context.Context, item Item, err error) {
+func retry(ctx context.Context, item Item, processErr error) {
 	newCount := item.RetryCount + 1
 
 	errJSON, _ := json.Marshal(map[string]any{
 		"time":    time.Now().UTC().Format(time.RFC3339),
-		"error":   err.Error(),
+		"error":   processErr.Error(),
 		"attempt": newCount,
 	})
 
@@ -179,20 +188,33 @@ func retry(ctx context.Context, item Item, err error) {
 			maxBackoff,
 		)
 
-		database.Pool.Exec(ctx, `
+		if _, err := database.Pool.Exec(ctx, `
 			UPDATE irori
 			SET status = 'pending', retry_count = $2, next_retry_at = $3, errors = array_append(errors, $4)
 			WHERE id = $1
-		`, item.ID, newCount, time.Now().Add(delay), errJSON)
-
-		slog.Warn("retry", "id", item.ID, "attempt", newCount, "next", delay)
+		`, item.ID, newCount, time.Now().Add(delay), errJSON); err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "failed to schedule retry",
+				slog.Int64("id", item.ID),
+				slog.Any("error", err))
+		} else {
+			slog.LogAttrs(ctx, slog.LevelWarn, "retry",
+				slog.Int64("id", item.ID),
+				slog.Int("attempt", newCount),
+				slog.Duration("next", delay))
+		}
 	} else {
-		database.Pool.Exec(ctx, `
+		if _, err := database.Pool.Exec(ctx, `
 			UPDATE irori
 			SET status = 'failed', retry_count = $2, completed_at = NOW(), errors = array_append(errors, $3)
 			WHERE id = $1
-		`, item.ID, newCount, errJSON)
-
-		slog.Error("failed", "id", item.ID, "error", err)
+		`, item.ID, newCount, errJSON); err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "failed to mark as failed",
+				slog.Int64("id", item.ID),
+				slog.Any("error", err))
+		} else {
+			slog.LogAttrs(ctx, slog.LevelError, "failed",
+				slog.Int64("id", item.ID),
+				slog.String("error", processErr.Error()))
+		}
 	}
 }
