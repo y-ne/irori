@@ -1,6 +1,8 @@
-banned machine-doll
+## banned machine-doll
 
-this queue system only tapped to postgresql.
+Queue system implementation which only tapped to postgres.
+
+NOTE: please do remember that currently Irori just a PET. if there's any suggestion feel free to open a PR.
 
 irori.sql
 
@@ -19,7 +21,12 @@ CREATE TABLE IF NOT EXISTS irori (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
 
-    CONSTRAINT notify_queue_status_check
+    CONSTRAINT irori_queue_status_check
         CHECK (status IN ('pending', 'processing', 'success', 'failed'))
 );
+```
+
+```sql
+CREATE INDEX IF NOT EXIST idx_irori_pending ON irori (next_retry_at)
+WHERE status = 'pending';
 ```
