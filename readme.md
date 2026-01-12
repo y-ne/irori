@@ -27,6 +27,6 @@ CREATE TABLE IF NOT EXISTS irori (
 ```
 
 ```sql
-CREATE INDEX IF NOT EXIST idx_irori_pending ON irori (next_retry_at)
+CREATE INDEX IF NOT EXISTS idx_irori_pending ON irori (next_retry_at)
 WHERE status = 'pending';
 ```

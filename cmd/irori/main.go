@@ -124,10 +124,10 @@ func processBatch(ctx context.Context, batchSize, concurrency int) error {
 }
 
 func processItem(ctx context.Context, item Item) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	processCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := process(ctx, item); err != nil {
+	if err := process(processCtx, item); err != nil {
 		retry(ctx, item, err)
 		return
 	}
