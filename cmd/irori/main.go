@@ -143,16 +143,6 @@ func processItem(ctx context.Context, item Item) {
 	}
 }
 
-func process(ctx context.Context, item Item) error {
-	var payload map[string]any
-	if err := json.Unmarshal(item.Payload, &payload); err != nil {
-		return err
-	}
-
-	// TODO: Implement your logic here
-	return nil
-}
-
 func retry(ctx context.Context, item Item, processErr error) {
 	newCount := item.RetryCount + 1
 	errJSON, _ := json.Marshal(map[string]any{
@@ -166,14 +156,14 @@ func retry(ctx context.Context, item Item, processErr error) {
 		delay := min(time.Duration(float64(backoff)*math.Pow(2, float64(newCount))), maxBackoff)
 		_, err = database.Pool.Exec(ctx, `
 			UPDATE irori
-			SET status = 'pending', retry_count = $2, next_retry_at = $3, errors = array_append(errors, $4)
+			SET status = 'pending', retry_count = $2, next_retry_at = $3, errors = array_append(errors, $4::jsonb)
 			WHERE id = $1
 		`, item.ID, newCount, time.Now().Add(delay), errJSON)
 		slog.LogAttrs(ctx, slog.LevelWarn, "retry", slog.Int64("id", item.ID), slog.Int("attempt", newCount))
 	} else {
 		_, err = database.Pool.Exec(ctx, `
 			UPDATE irori
-			SET status = 'failed', retry_count = $2, completed_at = NOW(), errors = array_append(errors, $3)
+			SET status = 'failed', retry_count = $2, completed_at = NOW(), errors = array_append(errors, $3::jsonb)
 			WHERE id = $1
 		`, item.ID, newCount, errJSON)
 		slog.LogAttrs(ctx, slog.LevelError, "failed", slog.Int64("id", item.ID), slog.String("error", processErr.Error()))
@@ -182,4 +172,14 @@ func retry(ctx context.Context, item Item, processErr error) {
 	if err != nil {
 		slog.LogAttrs(ctx, slog.LevelError, "retry update failed", slog.Int64("id", item.ID), slog.Any("error", err))
 	}
+}
+
+func process(ctx context.Context, item Item) error {
+	var payload map[string]any
+	if err := json.Unmarshal(item.Payload, &payload); err != nil {
+		return err
+	}
+
+	// TODO: Implement your logic here
+	return nil
 }
