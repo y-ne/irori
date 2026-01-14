@@ -19,11 +19,12 @@ import (
 )
 
 const (
-	pollInterval = 5 * time.Second
-	timeout      = 30 * time.Second
-	maxRetries   = 5
-	backoff      = 1 * time.Second
-	maxBackoff   = 5 * time.Minute
+	pollInterval      = 5 * time.Second
+	timeout           = 30 * time.Second
+	maxRetries        = 5
+	visibilityTimeout = 5 * time.Minute
+	backoff           = 1 * time.Second
+	maxBackoff        = 5 * time.Minute
 )
 
 type Item struct {
@@ -54,11 +55,11 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("shutting down")
+			slog.LogAttrs(ctx, slog.LevelInfo, "shutting down")
 			return
 		case <-ticker.C:
 			if err := processBatch(ctx, concurrency*3, concurrency); err != nil {
-				slog.Error("batch failed", "error", err)
+				slog.LogAttrs(ctx, slog.LevelError, "batch failed", slog.Any("error", err))
 			}
 		}
 	}
@@ -72,13 +73,14 @@ func processBatch(ctx context.Context, batchSize, concurrency int) error {
 	defer tx.Rollback(ctx)
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, payload, retry_count, max_retries
-		FROM irori
-		WHERE status = 'pending' AND next_retry_at <= NOW()
-		ORDER BY next_retry_at ASC
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`, batchSize)
+			SELECT id, payload, retry_count, max_retries
+			FROM irori
+			WHERE (status = 'pending' OR (status = 'processing' AND visible_at <= NOW()))
+			  AND next_retry_at <= NOW()
+			ORDER BY visible_at ASC
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, batchSize)
 	if err != nil {
 		return err
 	}
@@ -101,7 +103,12 @@ func processBatch(ctx context.Context, batchSize, concurrency int) error {
 		itemIDs[i] = item.ID
 	}
 
-	if _, err = tx.Exec(ctx, `UPDATE irori SET status = 'processing' WHERE id = ANY($1)`, itemIDs); err != nil {
+	if _, err = tx.Exec(ctx, `
+			UPDATE irori
+			SET status = 'processing',
+			    visible_at = NOW() + $2
+			WHERE id = ANY($1)
+		`, itemIDs, visibilityTimeout); err != nil {
 		return err
 	}
 
@@ -112,8 +119,7 @@ func processBatch(ctx context.Context, batchSize, concurrency int) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	for i := range items {
-		item := items[i]
+	for _, item := range items {
 		g.Go(func() error {
 			processItem(gctx, item)
 			return nil
@@ -133,7 +139,7 @@ func processItem(ctx context.Context, item Item) {
 	}
 
 	if _, err := database.Pool.Exec(ctx, `UPDATE irori SET status = 'success', completed_at = NOW() WHERE id = $1`, item.ID); err != nil {
-		slog.Error("mark success failed", "id", item.ID, "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "mark success failed", slog.Int64("id", item.ID), slog.Any("error", err))
 	}
 }
 
@@ -144,7 +150,6 @@ func process(ctx context.Context, item Item) error {
 	}
 
 	// TODO: Implement your logic here
-
 	return nil
 }
 
@@ -175,6 +180,6 @@ func retry(ctx context.Context, item Item, processErr error) {
 	}
 
 	if err != nil {
-		slog.Error("retry update failed", "id", item.ID, "error", err)
+		slog.LogAttrs(ctx, slog.LevelError, "retry update failed", slog.Int64("id", item.ID), slog.Any("error", err))
 	}
 }
