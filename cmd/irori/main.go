@@ -159,18 +159,24 @@ func retry(ctx context.Context, item Item, processErr error) {
 			SET status = 'pending', retry_count = $2, next_retry_at = $3, errors = array_append(errors, $4::jsonb)
 			WHERE id = $1
 		`, item.ID, newCount, time.Now().Add(delay), errJSON)
-		slog.LogAttrs(ctx, slog.LevelWarn, "retry", slog.Int64("id", item.ID), slog.Int("attempt", newCount))
+
+		if err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "retry update failed", slog.Int64("id", item.ID), slog.Any("error", err))
+		} else {
+			slog.LogAttrs(ctx, slog.LevelWarn, "retry", slog.Int64("id", item.ID), slog.Int("attempt", newCount))
+		}
 	} else {
 		_, err = database.Pool.Exec(ctx, `
 			UPDATE irori
 			SET status = 'failed', retry_count = $2, completed_at = NOW(), errors = array_append(errors, $3::jsonb)
 			WHERE id = $1
 		`, item.ID, newCount, errJSON)
-		slog.LogAttrs(ctx, slog.LevelError, "failed", slog.Int64("id", item.ID), slog.String("error", processErr.Error()))
-	}
 
-	if err != nil {
-		slog.LogAttrs(ctx, slog.LevelError, "retry update failed", slog.Int64("id", item.ID), slog.Any("error", err))
+		if err != nil {
+			slog.LogAttrs(ctx, slog.LevelError, "final update failed", slog.Int64("id", item.ID), slog.Any("error", err))
+		} else {
+			slog.LogAttrs(ctx, slog.LevelError, "failed", slog.Int64("id", item.ID), slog.String("error", processErr.Error()))
+		}
 	}
 }
 
